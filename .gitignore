@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# PyInstaller
+build/
+dist/
+*.spec.bak
+*.spec
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+userdata/startup.log
+
+# Runtime / user data (contains DB, caches, generated content)
+userdata/
+*.db
+*.sqlite
+*.sqlite3
+userdata/projects/未命名*.json
+userdata/化学结构式图片/
+userdata/已使用化妆品原料目录I.xlsx
+userdata/已使用化妆品原料目录II.xlsx
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# Backup folder (local副本)
+配方表助手 - 副本/
+
+# OMO session state (agent tool)
+.omo/
+
+# Sensitive / local
+.env
+.env.local
+*.local
