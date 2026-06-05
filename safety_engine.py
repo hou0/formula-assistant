@@ -565,8 +565,138 @@ def calc_moe(noael: float, sed: float) -> float:
 
 
 # ═══════════════════════════════════════════════
-# 综合评估: 对配方进行完整安全评估
+# v2 S3: TTC (Threshold of Toxicological Concern) 阈值法
+# 数据源: userdata/ttc_crashdb.json
+# 教材: 国家药监局高级研修学院《化妆品安全评估基础与实践》2025.4 第三章
 # ═══════════════════════════════════════════════
+_TTC_DB = None
+_TTC_DB_PATH = os.path.join(os.path.dirname(__file__), 'userdata', 'ttc_crashdb.json')
+
+
+def _load_ttc_db():
+    global _TTC_DB
+    if _TTC_DB is None:
+        try:
+            with open(_TTC_DB_PATH, 'r', encoding='utf-8') as f:
+                _TTC_DB = json.load(f)
+        except Exception:
+            _TTC_DB = {'ttc_thresholds_ug_per_kg_day': {}, 'cramer_keywords': {},
+                       'common_substances': {'entries': []}}
+    return _TTC_DB
+
+
+def classify_cramer(name_zh: str = '', name_inci: str = '', cas_no: str = '') -> dict:
+    """Cramer 决策树简化版分类。
+    Returns dict with keys: class (I/II/III/exclusion/None), reason, source
+    """
+    db = _load_ttc_db()
+    name_combined = (name_zh or '').upper() + '|' + (name_inci or '').upper()
+
+    # 1. Check exclusion keywords first
+    excl = db.get('cramer_keywords', {}).get('exclusion_keywords', [])
+    for kw in excl:
+        if kw.upper() in name_combined:
+            return {
+                'class': 'exclusion',
+                'reason': f'命中排除关键词「{kw}」，不适用TTC法，需查NOAEL或开展完整毒理学评估',
+                'source': 'TTC排除关键词表',
+                'ttc_threshold': None,
+            }
+
+    # 2. Check pre-cached common_substances
+    for entry in db.get('common_substances', {}).get('entries', []):
+        if entry.get('name', '').upper() in name_combined.upper() or \
+           entry.get('inci', '').upper() in name_combined.upper():
+            cls = entry.get('class')
+            return {
+                'class': cls,
+                'reason': f'预设数据库匹配：{entry.get("name")}/{entry.get("inci")} 属 Class {cls}',
+                'source': '常见成分Cramer预分类',
+                'ttc_threshold': db.get('ttc_thresholds_ug_per_kg_day', {}).get(cls),
+            }
+
+    # 3. Match keyword lists
+    for cls_name in ['I', 'II', 'III']:
+        kws = db.get('cramer_keywords', {}).get(f'class_{cls_name}', [])
+        for kw in kws:
+            if kw.upper() in name_combined:
+                return {
+                    'class': cls_name,
+                    'reason': f'关键词「{kw}」匹配 Class {cls_name}',
+                    'source': 'Cramer关键词表',
+                    'ttc_threshold': db.get('ttc_thresholds_ug_per_kg_day', {}).get(cls_name),
+                }
+
+    # 4. Default: Class III (conservative)
+    return {
+        'class': 'III',
+        'reason': '无关键词命中，默认按最保守的 Class III 处理',
+        'source': 'Cramer决策树默认',
+        'ttc_threshold': db.get('ttc_thresholds_ug_per_kg_day', {}).get('III'),
+    }
+
+
+def calc_ttc_assessment(
+    name_zh: str = '',
+    name_inci: str = '',
+    sed_ug_per_kg_day: float | None = None,
+    cas_no: str = '',
+) -> dict:
+    """根据 Cramer 分类 + SED 计算 TTC 评估。
+    Returns dict with keys: applicable, class, threshold, sed, moe, margin, reason, summary
+    """
+    cls = classify_cramer(name_zh, name_inci, cas_no)
+    threshold = cls.get('ttc_threshold')
+
+    if sed_ug_per_kg_day is None or sed_ug_per_kg_day <= 0:
+        return {
+            'applicable': cls.get('class') not in ('exclusion', None),
+            'class': cls.get('class'),
+            'threshold': threshold,
+            'sed': sed_ug_per_kg_day,
+            'moe': None,
+            'margin': None,
+            'reason': cls.get('reason'),
+            'source': cls.get('source'),
+            'summary': '无SED数据，无法计算TTC-MoE',
+        }
+
+    if cls.get('class') == 'exclusion':
+        return {
+            'applicable': False,
+            'class': 'exclusion',
+            'threshold': None,
+            'sed': sed_ug_per_kg_day,
+            'moe': None,
+            'margin': None,
+            'reason': cls.get('reason'),
+            'source': cls.get('source'),
+            'summary': '排除类物质，不适用TTC法',
+        }
+
+    moe = threshold / sed_ug_per_kg_day if threshold else None
+    margin = None
+    if moe is not None:
+        if moe >= 100:
+            margin = '安全裕度充足'
+        elif moe >= 10:
+            margin = '可接受范围'
+        else:
+            margin = '安全裕度不足'
+
+    return {
+        'applicable': True,
+        'class': cls.get('class'),
+        'threshold': threshold,
+        'sed': sed_ug_per_kg_day,
+        'moe': moe,
+        'margin': margin,
+        'reason': cls.get('reason'),
+        'source': cls.get('source'),
+        'summary': f'Class {cls.get("class")} TTC={threshold}μg/(kg·d), SED={sed_ug_per_kg_day:.4g}μg/(kg·d), MoE={moe:.1f}, {margin}' if moe else 'N/A',
+    }
+
+
 
 def assess_ingredient(
     name_zh: str,
@@ -634,6 +764,18 @@ def assess_ingredient(
     # Layer 6: Risk substance identification (based on 《化妆品风险物质识别与评估技术指导原则》)
     result['risk_substances'] = identify_risk_substances(name_zh, is_child_product)
 
+    # Layer 7: v2 S3 TTC threshold assessment (Cramer + MoE)
+    sed_ug = None
+    sed_mg = (result.get('exposure') or {}).get('sed')
+    if sed_mg is not None and sed_mg > 0:
+        sed_ug = sed_mg * 1000.0  # mg/kg/d -> μg/kg/d
+    result['ttc'] = calc_ttc_assessment(
+        name_zh=name_zh,
+        name_inci=name_inci,
+        sed_ug_per_kg_day=sed_ug,
+        cas_no=cas_no,
+    )
+
     # Overall assessment summary
     issues = []
     if result['banned']['banned']:
@@ -660,6 +802,7 @@ def assess_formula(
     population: str = '成人',
     body_weight_override: float | None = None,
     is_child_product: bool = False,
+    propellant_percent: float = 0,
 ) -> dict:
     """Run full safety assessment on an entire formula.
 
@@ -710,6 +853,12 @@ def assess_formula(
             comp_inci = comp.get('inci', '') or name_inci
             comp_cas = comp.get('cas', '') or item.get('cas_no', '') or ''
 
+            # v2 S4: 推进剂分离 — 调整其他原料浓度（扣除推进剂后×100%）
+            if propellant_percent and propellant_percent > 0 and base_concentration:
+                denom = (1 - propellant_percent / 100)
+                if denom > 0:
+                    base_concentration = base_concentration / denom
+
             # Calculate actual concentration for this component
             actual_concentration = base_concentration * comp_percent / 100 if base_concentration else None
 
@@ -753,6 +902,7 @@ def assess_formula(
         'failed': total - passed,
         'failed_ingredients': failed_ingredients,
         'all_pass': passed == total,
+        'propellant_percent': propellant_percent,  # v2 S4
         'summary': f'配方安全评估: {passed}/{total} 通过'
                    + (', 全部通过 ✓' if passed == total
                       else f', {total - passed} 个原料存在问题 ✗'),

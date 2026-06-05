@@ -1064,6 +1064,26 @@ def generate_safety_report(
         if sed_val is not None:
             parts.append(f'SED={sed_val:.6f} mg/kg bw/day')
 
+        # v2 S3: TTC 决策树评估（无 NOAEL 时启用）
+        ttc = r.get('ttc', {})
+        if ttc and ttc.get('class') and not toxicology.get('noael'):
+            cls = ttc.get('class')
+            thresh = ttc.get('threshold')
+            ttc_moe = ttc.get('moe')
+            margin = ttc.get('margin')
+            sed_ug = ttc.get('sed')
+            if cls == 'exclusion':
+                parts.append(f'Cramer 决策树分类属排除类（{ttc.get("reason")}），不适用TTC法')
+            elif thresh and sed_ug and ttc_moe is not None:
+                parts.append(
+                    f'Cramer 分类 Class {cls}（{ttc.get("source")}），'
+                    f'TTC={thresh}μg/(kg·d)，'
+                    f'SED={sed_ug:.4g}μg/(kg·d)，'
+                    f'MoE={ttc_moe:.1f}，{margin or "已评估"}'
+                )
+            else:
+                parts.append(f'Cramer 分类 Class {cls}（{ttc.get("source")}），TTC={thresh}μg/(kg·d)')
+
         # Conclusion
         if overall and not banned.get('banned'):
             parts.append('在正常使用条件下，该成分的使用是安全的')
