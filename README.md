@@ -20,7 +20,7 @@
 ### 1. 运行应用
 
 ```bash
-cd "c:\Users\houping\Desktop\配方表助手"
+cd "c:\Users\Desktop\配方表助手"
 .venv\Scripts\python.exe main.py
 ```
 
