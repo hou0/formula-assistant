@@ -4,6 +4,13 @@ import sqlite3
 import sys
 
 
+try:
+    import openpyxl
+    HAS_OPENPYXL = True
+except ImportError:
+    HAS_OPENPYXL = False
+
+
 def get_userdata_dir():
     if getattr(sys, 'frozen', False):
         base = os.path.dirname(sys.executable)
@@ -12,7 +19,34 @@ def get_userdata_dir():
     return os.path.join(base, 'userdata')
 
 
+def get_data_dir():
+    if getattr(sys, 'frozen', False):
+        base = os.path.dirname(sys.executable)
+        return os.path.join(base, 'data')
+    base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(os.path.normpath(os.path.join(base, '..')), 'data')
+
+
 DB_PATH = os.path.join(get_userdata_dir(), 'safety.db')
+EXCEL_PATH = os.path.join(get_data_dir(), '安全评估数据库_new.xlsx')
+
+_excel_wb = None
+
+
+def _load_excel():
+    global _excel_wb
+    if _excel_wb is None and HAS_OPENPYXL and os.path.exists(EXCEL_PATH):
+        _excel_wb = openpyxl.load_workbook(EXCEL_PATH,
+                                            data_only=True, read_only=True)
+    return _excel_wb
+
+
+def _read_excel_sheet(sheet_name):
+    wb = _load_excel()
+    if wb is None or sheet_name not in wb.sheetnames:
+        return []
+    ws = wb[sheet_name]
+    return [row for row in ws.iter_rows(min_row=2, values_only=True)]
 
 
 def get_db():
@@ -139,51 +173,6 @@ def init_db():
             max_conc_non_oxidative TEXT,
             restrictions TEXT,
             label_requirements TEXT
-        )
-    ''')
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS safety_usage_market (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            catalog_seq TEXT,
-            name_zh TEXT,
-            inci_name TEXT,
-            used_part TEXT,
-            method TEXT,
-            max_percent TEXT,
-            remarks TEXT
-        )
-    ''')
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS safety_usage_international (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            catalog_seq TEXT,
-            name_zh TEXT,
-            inci_name TEXT,
-            used_part TEXT,
-            method TEXT,
-            max_percent TEXT,
-            remarks TEXT
-        )
-    ''')
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS exposure_daily_usage (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            source TEXT,
-            seq TEXT,
-            application_site TEXT,
-            product_category TEXT,
-            daily_amount_g REAL,
-            retention_factor REAL,
-            reference TEXT
-        )
-    ''')
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS exposure_body_weight (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            age_group TEXT NOT NULL,
-            default_weight_kg REAL NOT NULL,
-            source TEXT,
-            notes TEXT
         )
     ''')
     conn.execute('''
@@ -666,6 +655,45 @@ def check_allowed_hair_dye(name_zh, name_inci=''):
 
 
 def query_usage_data(name_zh='', inci_name=''):
+    """Query usage data from unified Excel (fallback to DB)."""
+    # Try Excel first
+    if HAS_OPENPYXL:
+        try:
+            results = []
+            for sheet_name, source_label in [
+                ('已上市使用量', '已上市'),
+                ('国际索引', '国际')
+            ]:
+                rows = _read_excel_sheet(sheet_name)
+                for row in rows:
+                    # row: 序号, 目录序号, 原料名称, INCI名称, 作用部位,
+                    #      使用方法, 最大使用量(%), 备注
+                    name_zh_val = row[2] or ''
+                    inci_name_val = row[3] or ''
+                    match = True
+                    if name_zh:
+                        nz = name_zh.strip()
+                        if nz not in name_zh_val:
+                            match = False
+                    if inci_name:
+                        iz = inci_name.strip()
+                        if iz not in inci_name_val:
+                            match = False
+                    if match:
+                        results.append({
+                            'catalog_seq': row[1],
+                            'name_zh': row[2],
+                            'inci_name': row[3],
+                            'used_part': row[4],
+                            'method': row[5],
+                            'max_percent': row[6],
+                            'remarks': row[7],
+                            'source_type': source_label
+                        })
+            return results
+        except Exception:
+            pass
+    # Fallback to DB
     results = []
     conn = get_db()
     for table, source_label in [
@@ -692,6 +720,33 @@ def query_usage_data(name_zh='', inci_name=''):
 
 
 def query_exposure(product_category='', application_site=''):
+    """Query exposure data from unified Excel (fallback to DB)."""
+    if HAS_OPENPYXL:
+        try:
+            rows = _read_excel_sheet('暴露量参数')
+            results = []
+            for row in rows:
+                # row: 产品类别, 使用部位, 数据来源, 日均使用量(g), 驻留因子, 备注
+                match = True
+                if product_category:
+                    if not row[0] or product_category.strip() not in row[0]:
+                        match = False
+                if application_site:
+                    if not row[1] or application_site.strip() not in str(row[1]):
+                        match = False
+                if match:
+                    results.append({
+                        'product_category': row[0],
+                        'application_site': row[1],
+                        'source': row[2],
+                        'daily_amount_g': row[3],
+                        'retention_factor': row[4],
+                        'notes': row[5]
+                    })
+            return results
+        except Exception:
+            pass
+    # Fallback to DB
     conn = get_db()
     clauses = []
     params = []
@@ -712,6 +767,21 @@ def query_exposure(product_category='', application_site=''):
 
 
 def get_body_weight(age_group='成人'):
+    """Query body weight from unified Excel (fallback to DB)."""
+    if HAS_OPENPYXL:
+        try:
+            rows = _read_excel_sheet('体重参数')
+            for row in rows:
+                if row[0] and age_group.strip() in row[0]:
+                    return {
+                        'age_group': row[0],
+                        'default_weight_kg': row[1],
+                        'source': row[2],
+                        'notes': row[3]
+                    }
+        except Exception:
+            pass
+    # Fallback to DB
     conn = get_db()
     rows = conn.execute(
         'SELECT * FROM exposure_body_weight WHERE age_group LIKE ?',
@@ -730,6 +800,61 @@ def get_body_weight(age_group='成人'):
         'default_weight_kg': 60.0,
         'source': 'default'
     }
+
+
+def query_risk_substances(substance_name='', trigger_keyword=''):
+    rows = _read_excel_sheet('风险物质识别')
+    if not rows:
+        return []
+    results = []
+    for row in rows:
+        name = row[1] or ''
+        keywords = (row[2] or '').strip()
+        limit_val = row[4] or ''
+        ref = row[5] or ''
+        desc = row[6] or ''
+
+        if substance_name and substance_name.strip():
+            if substance_name.strip() not in name:
+                continue
+
+        if trigger_keyword and trigger_keyword.strip():
+            if trigger_keyword.strip() not in keywords:
+                continue
+
+        results.append({
+            'risk_type': row[0] or '',
+            'substance_name': name,
+            'trigger_keywords': keywords,
+            'trigger_all': row[3] or '',
+            'limit': limit_val,
+            'source': ref,
+            'description': desc,
+        })
+    return results
+
+
+def query_authority_opinions(name_zh='', inci_name=''):
+    rows = _read_excel_sheet('权威评估意见')
+    if not rows:
+        return []
+    results = []
+    for row in rows:
+        name = row[0] or ''
+        inci = row[1] or ''
+        if name_zh and name_zh.strip() not in name:
+            continue
+        if inci_name and inci_name.strip() not in inci:
+            continue
+        results.append({
+            'name_zh': name,
+            'name_inci': inci,
+            'cas_no': row[2] or '',
+            'authority': row[3] or '',
+            'opinion': row[4] or '',
+            'reference': row[5] or '',
+        })
+    return results
 
 
 def init_product_categories():

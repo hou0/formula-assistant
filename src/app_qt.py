@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
     QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout,
     QTableWidget, QTableWidgetItem, QPushButton, QLabel, QLineEdit,
     QDoubleSpinBox, QHeaderView, QMessageBox, QFileDialog,
-    QPlainTextEdit, QProgressBar, QFrame, QAbstractItemView,
+    QPlainTextEdit, QTextBrowser, QProgressBar, QFrame, QAbstractItemView,
     QDialog, QFormLayout, QDialogButtonBox, QCompleter, QCheckBox,
     QComboBox, QInputDialog, QGroupBox,
     QGridLayout, QAbstractSpinBox
@@ -464,11 +464,11 @@ class CrawlWorker(QThread):
 
     def run(self):
         try:
-            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
             if self.cat_type == 'I':
-                import crawl_catalog_i as cm
+                import crawlers.crawl_catalog_i as cm
             else:
-                import crawl_catalog_ii as cm
+                import crawlers.crawl_catalog_ii as cm
 
             from catalog_mgr import USERDATA_DIR as output_dir
 
@@ -749,10 +749,14 @@ class FormulaDesignTab(QWidget):
         self.btn_clear = QPushButton("清空配方")
         self.btn_clear.clicked.connect(self._on_clear)
         bottom.addWidget(self.btn_clear)
-        
-        self.btn_check_composition = QPushButton("检查成分含量")
-        self.btn_check_composition.clicked.connect(self._on_check_composition)
-        bottom.addWidget(self.btn_check_composition)
+
+        # v2 S8: 配方总含量实时提示
+        self._total_percent_label = QLabel('总含量：—')
+        self._total_percent_label.setStyleSheet(
+            "padding: 4px 10px; border-radius: 4px; font-weight: bold; font-size: 12px;"
+        )
+        bottom.addWidget(self._total_percent_label)
+        bottom.addStretch()
         
         bottom.addStretch()
         
@@ -769,6 +773,7 @@ class FormulaDesignTab(QWidget):
     def refresh(self):
         self._materials_cache = db.get_all_raw_materials()
         self._reload_table()
+        self._update_total_percent()
 
     def _reload_table(self):
         formula = db.get_current_formula()
@@ -935,6 +940,54 @@ class FormulaDesignTab(QWidget):
             is_new = is_new_item.text().strip() if is_new_item else ('是' if row_data['是否新原料'] else '')
             db.update_formula_material_info(formula_id, 1 if is_new == '是' else 0, new_text, purpose)
 
+        # v2 S8: 任意单元格变化后重算总含量
+        self._update_total_percent()
+
+    def _update_total_percent(self):
+        """重算配方总含量并更新标签颜色。
+        - 总含量 = 100% ± 0.01% → 绿色 ✓
+        - 偏离 0.01-1% → 黄色 ⚠
+        - 偏离 > 1% 或为 0% → 红色 ❌
+        """
+        if not hasattr(self, '_total_percent_label'):
+            return
+        formula = db.get_current_formula()
+        if not formula:
+            self._total_percent_label.setText('总含量：—')
+            self._total_percent_label.setStyleSheet(
+                "padding: 4px 10px; border-radius: 4px; font-weight: bold; font-size: 12px;"
+                "background-color: #f3f4f6; color: #6b7280;"
+            )
+            return
+
+        total = 0.0
+        for item in formula:
+            try:
+                pct = float(item.get('added_percent') or 0)
+                total += pct
+            except (ValueError, TypeError):
+                pass
+
+        diff = abs(total - 100.0)
+        if total == 0:
+            label = '总含量：0.00%'
+            bg, fg, icon = '#fee2e2', '#dc2626', '❌'
+        elif diff <= 0.01:
+            label = f'总含量：{total:.2f}%  {icon if False else "✓ 合格"}'
+            bg, fg, icon = '#dcfce7', '#16a34a', '✓'
+        elif diff <= 1.0:
+            label = f'总含量：{total:.2f}%  ⚠ 偏离 {diff:.2f}%'
+            bg, fg = '#fef3c7', '#ca8a04'
+        else:
+            label = f'总含量：{total:.2f}%  ❌ 偏离 {diff:.2f}%'
+            bg, fg = '#fee2e2', '#dc2626'
+
+        self._total_percent_label.setText(label)
+        self._total_percent_label.setStyleSheet(
+            f"padding: 4px 10px; border-radius: 4px; font-weight: bold; font-size: 12px;"
+            f"background-color: {bg}; color: {fg};"
+        )
+
     def _on_search_changed(self, text):
         if len(text) < 1:
             self.completer.setModel(QStringListModel([]))
@@ -975,6 +1028,7 @@ class FormulaDesignTab(QWidget):
         percent = self.spin_percent.value()
         db.add_to_formula(mat_id, percent, is_new)
         self._reload_table()
+        self._update_total_percent()
 
     def _on_batch_add(self):
         text = self.batch_input.text().strip()
@@ -1007,15 +1061,18 @@ class FormulaDesignTab(QWidget):
         QMessageBox.information(self, "批量添加结果", msg)
         self.batch_input.clear()
         self._reload_table()
+        self._update_total_percent()
 
     def _on_remove(self, fid):
         db.remove_from_formula(fid)
         self._reload_table()
+        self._update_total_percent()
 
     def _on_clear(self):
         if QMessageBox.question(self, "确认", "确定清空全部配方？") == QMessageBox.Yes:
             db.clear_formula()
             self._reload_table()
+            self._update_total_percent()
 
     def _on_export(self):
         formula = db.get_current_formula()
@@ -1046,88 +1103,142 @@ class FormulaDesignTab(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "生成失败", str(e) + "\n" + traceback.format_exc())
 
-    def _on_check_composition(self):
-        """检查配方原料成分含量"""
-        formula = db.get_current_formula()
-        if not formula:
-            QMessageBox.warning(self, "提示", "当前配方为空，请先添加原料")
-            return
-        
-        errors = []
-        warnings = []
-        total_percent = 0.0
-        
-        for idx, item in enumerate(formula):
-            mat_name = item['name_zh'] or '未知原料'
-            
-            # 1. 检查原料含量
-            try:
-                mat_percent = float(item['added_percent'])
-                if mat_percent <= 0 or mat_percent > 100:
-                    errors.append(f"原料 {idx+1} [{mat_name}] 含量 {mat_percent}% 超出有效范围（0-100%）")
-                total_percent += mat_percent
-            except (ValueError, TypeError):
-                errors.append(f"原料 {idx+1} [{mat_name}] 含量格式错误")
-            
-            # 2. 检查原料中各成分含量
-            comps = json.loads(item['composition']) if item['composition'] else []
-            if not comps:
-                warnings.append(f"原料 {idx+1} [{mat_name}] 未配置成分组成")
-                continue
-            
-            # 计算成分含量总和
-            comp_total = 0.0
-            for c in comps:
-                try:
-                    comp_p = float(c['percent'])
-                    if comp_p <= 0 or comp_p > 100:
-                        errors.append(f"原料 {idx+1} [{mat_name}] 成分 [{c['name']}] 含量 {comp_p}% 超出有效范围")
-                    comp_total += comp_p
-                except (ValueError, TypeError):
-                    errors.append(f"原料 {idx+1} [{mat_name}] 成分 [{c['name']}] 含量格式错误")
-            
-            # 检查成分含量总和
-            if abs(comp_total - 100) > 0.01:
-                errors.append(f"原料 {idx+1} [{mat_name}] 成分含量总和 {comp_total:.2f}%，应为100%")
-        
-        # 3. 检查配方总含量
-        if abs(total_percent - 100) > 0.01:
-            errors.append(f"配方总含量 {total_percent:.2f}%，应为100%")
-        
-        # 显示检查结果
-        result_text = "【成分含量检查结果】\n\n"
-        
-        if errors:
-            result_text += "❌ 错误：\n"
-            for err in errors:
-                result_text += f"  - {err}\n"
-            result_text += "\n"
-        
-        if warnings:
-            result_text += "⚠️ 警告：\n"
-            for warn in warnings:
-                result_text += f"  - {warn}\n"
-            result_text += "\n"
-        
-        if not errors and not warnings:
-            result_text += "✅ 所有成分含量检查通过！\n"
-        
-        result_text += f"\n配方总含量：{total_percent:.2f}%"
-        
-        # 显示对话框
-        msg_box = QMessageBox(self)
-        if errors:
-            msg_box.setIcon(QMessageBox.Critical)
-            msg_box.setWindowTitle("检查失败")
-        elif warnings:
-            msg_box.setIcon(QMessageBox.Warning)
-            msg_box.setWindowTitle("检查完成（有警告）")
-        else:
-            msg_box.setIcon(QMessageBox.Information)
-            msg_box.setWindowTitle("检查通过")
-        msg_box.setText(result_text)
-        msg_box.setStandardButtons(QMessageBox.Ok)
-        msg_box.exec()
+
+# ── Three Tables Preview Dialog ──
+
+class ThreeTablesPreviewDialog(QDialog):
+    """\u9884\u89c8 3 \u5927\u62a5\u544a\u8868 + \u7b2c\u56db\u90e8\u5206\uff08\u914d\u65b9\u8868 / \u5b9e\u9645\u6210\u5206\u542b\u91cf / \u98ce\u9669\u7269\u8d28\u5371\u5bb3\u8bc6\u522b / \u6210\u5206\u5b89\u5168\u8bc4\u4f30\uff09"""
+
+    def __init__(self, tables: dict, section4: dict, parent=None):
+        super().__init__(parent)
+        self.tables = tables
+        self.section4 = section4
+        self.setWindowTitle('\u9884\u89c8\u62a5\u544a\u6838\u5fc3\u5185\u5bb9')
+        self.resize(1000, 700)
+
+        layout = QVBoxLayout(self)
+
+        self.tabs = QTabWidget()
+        for key in ('table1', 'table2', 'table3'):
+            tab = tables[key]
+            page = QWidget()
+            v = QVBoxLayout(page)
+
+            title = QLabel(tab['title'])
+            title.setStyleSheet("font-weight: bold; font-size: 14px; padding: 6px;")
+            title.setAlignment(Qt.AlignCenter)
+            v.addWidget(title)
+
+            table = QTableWidget()
+            headers = tab['headers']
+            rows = tab['rows']
+            table.setColumnCount(len(headers))
+            table.setRowCount(len(rows))
+            table.setHorizontalHeaderLabels(headers)
+            table.verticalHeader().setVisible(False)
+            table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+            table.setSelectionBehavior(QAbstractItemView.SelectRows)
+            table.setAlternatingRowColors(True)
+
+            header = table.horizontalHeader()
+            header.setSectionResizeMode(QHeaderView.Stretch)
+            header.setStyleSheet(
+                "QHeaderView::section { background: #dbeafe; font-weight: bold; padding: 6px; }"
+            )
+
+            for r, row_data in enumerate(rows):
+                for c, val in enumerate(row_data):
+                    item = QTableWidgetItem(str(val) if val is not None else '')
+                    item.setTextAlignment(Qt.AlignCenter)
+                    table.setItem(r, c, item)
+
+            table.resizeRowsToContents()
+            v.addWidget(table)
+
+            if key == 'table3':
+                src_html = (
+                    "<b>\u6570\u636e\u6765\u6e90\u8bf4\u660e\uff1a</b><br>"
+                    "\u2022 <b>\u6807\u51c6\u4e2d\u6587\u540d\u79f0</b>\uff1a"
+                    "safety_engine.assess_formula() \u8fd4\u56de\u7684 ingredient \u5b57\u6bb5\uff1b"
+                    "\u98ce\u9669\u7269\u8d28\u884c\u76f4\u63a5\u4f7f\u7528\u98ce\u9669\u7269\u8d28\u672c\u8eab\u540d\u79f0\u3002<br>"
+                    "\u2022 <b>\u53ef\u80fd\u542b\u6709\u7684\u98ce\u9669\u7269\u8d28</b>\uff1a"
+                    "database.check_banned() / check_restricted() \u7b49\u7981\u7528/\u9650\u7528\u8868\u8bc6\u522b\u7ed3\u679c\uff1b"
+                    "\u65e0\u98ce\u9669\u5219\u6807\u8bb0\u4e3a\u201c\u901a\u8fc7\u5b89\u5168\u8bc4\u4f30\u201d\u3002<br>"
+                    "\u2022 <b>\u5907\u6ce8</b>\uff1a"
+                    "\u6839\u636e risk_substances \u5217\u8868\u662f\u5426\u4e3a\u7a7a\u5224\u65ad\uff1a"
+                    "\u201c\u7b26\u5408\u9650\u91cf\u8981\u6c42\u201d\u6216\u201c\u65e0\u98ce\u9669\u201d\u3002"
+                )
+                src_label = QLabel(src_html)
+                src_label.setWordWrap(True)
+                src_label.setTextFormat(Qt.RichText)
+                src_label.setStyleSheet(
+                    "color: #475569; padding: 8px; font-size: 11px; "
+                    "background: #f8fafc; border-left: 3px solid #3b82f6;"
+                )
+                v.addWidget(src_label)
+
+            self.tabs.addTab(page, tab['title'])
+
+        # 4th tab: Section 4 — per-ingredient safety assessment
+        self.tabs.addTab(self._build_section4_page(section4), section4['title'])
+
+        layout.addWidget(self.tabs)
+
+        btn_box = QDialogButtonBox(QDialogButtonBox.Close)
+        btn_box.rejected.connect(self.reject)
+        layout.addWidget(btn_box)
+
+    def _build_section4_page(self, section4: dict) -> QWidget:
+        page = QWidget()
+        v = QVBoxLayout(page)
+
+        title = QLabel(section4['title'])
+        title.setStyleSheet("font-weight: bold; font-size: 14px; padding: 6px;")
+        title.setAlignment(Qt.AlignCenter)
+        v.addWidget(title)
+
+        text_browser = QTextBrowser()
+        text_browser.setOpenExternalLinks(True)
+        text_browser.setStyleSheet(
+            "QTextBrowser { background: #ffffff; padding: 8px; font-size: 12pt; "
+            "font-family: 'Times New Roman', '宋体'; }"
+        )
+
+        html_parts = ['<html><body style="line-height: 1.6;">']
+        for p in section4['paragraphs']:
+            if p['type'] == 'single':
+                html_parts.append(
+                    f"<p style='margin: 8px 0 4px 0; text-indent: 2em;'>"
+                    f"<b>{p['material_idx']}\u53f7\u539f\u6599\uff1a</b>"
+                    f"{p['name']}\uff0c{p['text']}</p>"
+                )
+            elif p['type'] == 'composite_head':
+                comps = '\u3001'.join(p['components'][:-1]) + '\u548c' + p['components'][-1]
+                html_parts.append(
+                    f"<p style='margin: 8px 0 4px 0; text-indent: 2em;'>"
+                    f"<b>{p['material_idx']}\u53f7\u539f\u6599\uff1a</b>{comps}\u7684\u6df7\u5408\u7269\u3002</p>"
+                )
+            elif p['type'] == 'composite_sub':
+                html_parts.append(
+                    f"<p style='margin: 4px 0; text-indent: 2em;'>"
+                    f"{p['name']}\uff0c{p['text']}</p>"
+                )
+
+        if section4.get('references'):
+            html_parts.append(
+                "<hr style='margin: 12px 0; border: none; border-top: 1px solid #e5e7eb;'>"
+                "<p style='color: #475569; font-size: 10pt;'>"
+                "<b>\u53c2\u8003\u6587\u732e\uff1a</b></p><ol style='font-size: 10pt; color: #475569;'>"
+            )
+            for ref in section4['references']:
+                html_parts.append(f"<li>{ref}</li>")
+            html_parts.append('</ol>')
+
+        html_parts.append('</body></html>')
+        text_browser.setHtml('\n'.join(html_parts))
+        v.addWidget(text_browser)
+
+        return page
 
 
 # ── Label Preview Dialog ──
@@ -1959,6 +2070,17 @@ class SafetyAssessmentTab(QWidget):
         self.site_combo.currentTextChanged.connect(self._update_exposure_params)
         exp_grid.addWidget(self.site_combo, 0, 7)
 
+        # v2 S4: 推进剂百分比（气雾剂专用，0 表示无推进剂）
+        exp_grid.addWidget(QLabel('推进剂占比(%):'), 0, 8)
+        self.propellant_spin = QDoubleSpinBox()
+        self.propellant_spin.setRange(0, 80)
+        self.propellant_spin.setSuffix('%')
+        self.propellant_spin.setValue(0)
+        self.propellant_spin.setToolTip('气雾剂产品中推进剂占总配方的百分比。\n'
+            '其他原料浓度将扣除推进剂后 ×100% 重新计算。\n'
+            '推进剂应与其他原料分开评估。')
+        exp_grid.addWidget(self.propellant_spin, 0, 9)
+
         # Row 1 — 使用人群 | 驻留因子 | 日均使用量 | 体重
         exp_grid.addWidget(QLabel('使用人群:'), 1, 0)
         self.population_combo = QComboBox()
@@ -2202,6 +2324,10 @@ class SafetyAssessmentTab(QWidget):
         self.btn_word_report = QPushButton('生成Word报告')
         self.btn_word_report.clicked.connect(self._on_generate_word_report)
         action_bar.addWidget(self.btn_word_report)
+
+        self.btn_preview_3tables = QPushButton('预览 3 大表')
+        self.btn_preview_3tables.clicked.connect(self._on_preview_3tables)
+        action_bar.addWidget(self.btn_preview_3tables)
 
         self.btn_save_project = QPushButton('保存项目')
         self.btn_save_project.clicked.connect(self._on_save_project)
@@ -2745,7 +2871,8 @@ class SafetyAssessmentTab(QWidget):
         try:
             result = se.assess_formula(formula, product_category, application_site,
                                        daily_amount_override, retention_override, data_source,
-                                       population, body_weight_override)
+                                       population, body_weight_override,
+                                       propellant_percent=self.propellant_spin.value())
             self._display_results(result)
         except Exception as e:
             QMessageBox.warning(self, '\u8bc4\u4f30\u5931\u8d25', f'\u5b89\u5168\u8bc4\u4f30\u51fa\u9519: {e}')
@@ -3092,6 +3219,22 @@ class SafetyAssessmentTab(QWidget):
         except Exception as e:
             QMessageBox.warning(self, '\u5931\u8d25', f'\u62a5\u544a\u751f\u6210\u51fa\u9519: {e}')
 
+    def _on_preview_3tables(self):
+        """\u9884\u89c8 3 \u5927\u8868 + \u7b2c\u56db\u90e8\u5206"""
+        if not self._results or not isinstance(self._results, dict) or 'results' not in self._results:
+            QMessageBox.information(self, '\u63d0\u793a', '\u8bf7\u5148\u8fd0\u884c\u5b89\u5168\u8bc4\u4f30')
+            return
+        formula = db.get_current_formula()
+        results = self._results.get('results', [])
+        try:
+            tables = rg.build_3tables_data(formula, results)
+            section4 = rg.build_section4_data(results)
+        except Exception as e:
+            QMessageBox.warning(self, '\u5931\u8d25', f'\u6784\u5efa\u9884\u89c8\u6570\u636e\u51fa\u9519: {e}')
+            return
+        dlg = ThreeTablesPreviewDialog(tables, section4, self)
+        dlg.exec()
+
     # ── Project persistence ──
 
     def _on_save_project(self):
@@ -3166,6 +3309,8 @@ class SafetyAssessmentTab(QWidget):
                 self._results = data.get('assessment', None)
                 if self._results:
                     self._display_results(self._results)
+                if hasattr(self, 'tab_formula'):
+                    self.tab_formula.refresh()
                 QMessageBox.information(self, '\u6210\u529f', f'\u9879\u76ee\u5df2\u52a0\u8f7d: {proj["name"]}')
 
 

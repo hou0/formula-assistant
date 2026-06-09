@@ -468,6 +468,215 @@ def _compute_actual_components(formula_rows: list[dict]) -> list[dict]:
     return components
 
 
+def load_references_seed() -> dict:
+    """Load references seed from userdata/references_seed.json."""
+    try:
+        seed_path = os.path.join(os.path.dirname(__file__), 'userdata', 'references_seed.json')
+        with open(seed_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        refs = data.get('references', [])
+        return {r['id']: r['citation'] for r in refs}
+    except Exception:
+        return {}
+
+
+class RefRegistry:
+    """Manage collected references and produce [N] markers.
+
+    Standalone (does not depend on generate_safety_report closure).
+    """
+
+    def __init__(self, seed: dict | None = None):
+        self.seed = seed or load_references_seed()
+        self.collected: list[str] = []
+        self.index_map: dict[str, int] = {}
+
+    def add(self, ref_text: str) -> str:
+        """Register a reference and return its [N] marker. Dedup by text."""
+        if not ref_text:
+            return ''
+        ref_text = ref_text.strip()
+        if ref_text in self.index_map:
+            return f'[{self.index_map[ref_text]}]'
+        for _cid, citation in self.seed.items():
+            if ref_text in citation or citation in ref_text:
+                if citation in self.index_map:
+                    return f'[{self.index_map[citation]}]'
+                idx = len(self.collected) + 1
+                self.collected.append(citation)
+                self.index_map[citation] = idx
+                return f'[{idx}]'
+        idx = len(self.collected) + 1
+        self.collected.append(ref_text)
+        self.index_map[ref_text] = idx
+        return f'[{idx}]'
+
+
+def _build_comp_text(r: dict, refs: RefRegistry) -> str:
+    """Build assessment text for a single component result."""
+    concentration = r.get('concentration', 0)
+    banned = r.get('banned', {})
+    restricted = r.get('restricted', {})
+    usage = r.get('usage_reference', {})
+    exposure = r.get('exposure', {})
+    overall = r.get('overall_pass', False)
+    toxicology = r.get('toxicology', {})
+
+    parts = []
+
+    ref_source = usage.get('source', '')
+    if ref_source:
+        if 'CIR' in ref_source or '美国化妆品' in ref_source:
+            parts.append('美国化妆品原料评价委员会（CIR）评估结果显示')
+            parts.append(refs.add('CIR'))
+        elif 'SCCS' in ref_source:
+            parts.append('欧洲消费者安全科学委员会（SCCS）评估结果显示')
+            parts.append(refs.add('SCCS'))
+        elif 'IFRA' in ref_source or '国际日用香料' in ref_source:
+            parts.append('其使用符合国际日用香料香精协会（IFRA）要求')
+            parts.append(refs.add('IFRA'))
+        else:
+            parts.append(f'参考{ref_source}')
+            parts.append(refs.add(ref_source))
+
+    if toxicology.get('noael') and toxicology.get('moes') is not None:
+        parts.append(f'NOAEL={toxicology["noael"]} mg/kg bw/day，MOE={toxicology["moes"]:.2f}')
+    elif toxicology.get('noael'):
+        parts.append(f'NOAEL={toxicology["noael"]} mg/kg bw/day')
+    if toxicology.get('loael'):
+        parts.append(f'LOAEL={toxicology["loael"]} mg/kg bw/day')
+
+    ref_max = usage.get('ref_max')
+    if ref_max is not None:
+        if restricted.get('restricted'):
+            parts.append(f'在驻留类化妆品中的使用浓度不超过{ref_max}%')
+        elif usage.get('within_range') is True or usage.get('within_range') is None:
+            parts.append(f'在驻留类化妆品中的使用浓度为{ref_max}%')
+    else:
+        parts.append(f'该原料的添加量为{concentration}%')
+
+    if restricted.get('restricted'):
+        if restricted.get('concentration_ok') is True:
+            parts.append(f'本配方{concentration}%在限用范围内，应用风险在可接受范围之内')
+        elif restricted.get('concentration_ok') is False:
+            parts.append(f'本配方{concentration}%超出限用要求')
+    elif usage.get('within_range') is not False:
+        parts.append('在本产品中应用风险在可接受范围之内')
+
+    if banned.get('banned'):
+        parts.append('该原料为禁用成分')
+
+    sed_val = exposure.get('sed')
+    if sed_val is not None:
+        parts.append(f'SED={sed_val:.6f} mg/kg bw/day')
+
+    ttc = r.get('ttc', {})
+    if ttc and ttc.get('class') and not toxicology.get('noael'):
+        cls = ttc.get('class')
+        thresh = ttc.get('threshold')
+        ttc_moe = ttc.get('moe')
+        margin = ttc.get('margin')
+        sed_ug = ttc.get('sed')
+        if cls == 'exclusion':
+            parts.append(f'Cramer 决策树分类属排除类（{ttc.get("reason")}），不适用TTC法')
+        elif thresh and sed_ug and ttc_moe is not None:
+            parts.append(
+                f'Cramer 分类 Class {cls}（{ttc.get("source")}），'
+                f'TTC={thresh}μg/(kg·d)，'
+                f'SED={sed_ug:.4g}μg/(kg·d)，'
+                f'MoE={ttc_moe:.1f}，{margin or "已评估"}'
+            )
+        else:
+            parts.append(f'Cramer 分类 Class {cls}（{ttc.get("source")}），TTC={thresh}μg/(kg·d)')
+
+    ra = r.get('read_across', {})
+    if ra and ra.get('applicable') and not toxicology.get('noael'):
+        ana = ra.get('analogue', '')
+        noael_src = ra.get('noael_source', '')
+        uf = ra.get('uncertainty_factor', 1)
+        dq = ra.get('data_quality', '中')
+        parts.append(
+            f'采用 Read-across 类比评估：类比物「{ana}」'
+            f'（{ra.get("justification", "")}），'
+            f'NOAEL 数据源 {noael_src}，'
+            f'不确定因子 {uf}（数据质量：{dq}）'
+        )
+
+    if overall and not banned.get('banned'):
+        parts.append('在正常使用条件下，该成分的使用是安全的')
+    elif not overall:
+        parts.append('在正常使用条件下，该成分的安全性需要关注')
+
+    return '，'.join(parts) + '。'
+
+
+def build_section4_data(results: list[dict]) -> dict:
+    """Build the assessment text for '四、配方中各成分的安全评估'.
+
+    Returns: {
+        'title': '四、配方中各成分的安全评估',
+        'paragraphs': [
+            {'type': 'single'|'composite_head'|'composite_sub',
+             'material_idx': 1,
+             'name': '...',           # for single / composite_sub
+             'components': ['...'],   # for composite_head
+             'text': '...',           # for single / composite_sub
+            },
+            ...
+        ],
+        'references': ['...', ...]   # collected refs in order
+    }
+    """
+    from collections import OrderedDict
+    grouped = OrderedDict()
+    for r in results:
+        fid = r.get('formula_id')
+        if fid is None:
+            fid = f'__flat_{id(r)}'
+        if fid not in grouped:
+            grouped[fid] = []
+        grouped[fid].append(r)
+
+    refs = RefRegistry()
+    paragraphs = []
+    material_idx = 0
+    for _fid, group in grouped.items():
+        material_idx += 1
+        if len(group) == 1:
+            r = group[0]
+            ing_name = r.get('ingredient', '')
+            text = _build_comp_text(r, refs)
+            paragraphs.append({
+                'type': 'single',
+                'material_idx': material_idx,
+                'name': ing_name,
+                'text': text,
+            })
+        else:
+            comp_names = [r.get('ingredient', '') for r in group]
+            paragraphs.append({
+                'type': 'composite_head',
+                'material_idx': material_idx,
+                'components': comp_names,
+                'text': f'{"、".join(comp_names[:-1])}和{comp_names[-1]}的混合物。',
+            })
+            for r in group:
+                comp_name = r.get('ingredient', '')
+                text = _build_comp_text(r, refs)
+                paragraphs.append({
+                    'type': 'composite_sub',
+                    'material_idx': material_idx,
+                    'name': comp_name,
+                    'text': text,
+                })
+
+    return {
+        'title': '四、配方中各成分的安全评估',
+        'paragraphs': paragraphs,
+        'references': refs.collected,
+    }
+
+
 def _build_assessment_table_data(results: list[dict]) -> list[list]:
     """Build 表3 data rows from assessment results."""
     rows = []
@@ -628,40 +837,9 @@ def generate_safety_report(
     #  v2 S1: 参考文献 [N] 编号系统
     #  数据源: userdata/references_seed.json
     # ══════════════════════════════════════════
-    def _load_references_seed():
-        try:
-            seed_path = os.path.join(os.path.dirname(__file__), 'userdata', 'references_seed.json')
-            with open(seed_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            # Build lookup by id and by keyword
-            refs = data.get('references', [])
-            return {r['id']: r['citation'] for r in refs}
-        except Exception:
-            return {}
-
-    _REF_CITATIONS = _load_references_seed()
-    collected_refs = []
-    ref_index_map = {}
-
-    def add_ref(ref_text: str) -> str:
-        """Register a reference and return its [N] marker. Dedup by text."""
-        if not ref_text:
-            return ''
-        ref_text = ref_text.strip()
-        if ref_text in ref_index_map:
-            return f'[{ref_index_map[ref_text]}]'
-        for cid, citation in _REF_CITATIONS.items():
-            if ref_text in citation or citation in ref_text:
-                if citation in ref_index_map:
-                    return f'[{ref_index_map[citation]}]'
-                idx = len(collected_refs) + 1
-                collected_refs.append(citation)
-                ref_index_map[citation] = idx
-                return f'[{idx}]'
-        idx = len(collected_refs) + 1
-        collected_refs.append(ref_text)
-        ref_index_map[ref_text] = idx
-        return f'[{idx}]'
+    _ref_registry = RefRegistry()
+    add_ref = _ref_registry.add
+    collected_refs = _ref_registry.collected
 
     # ══════════════════════════════════════════
     #  v2 S2: 风险控制措施动态生成
@@ -1000,97 +1178,6 @@ def generate_safety_report(
             grouped[fid] = []
         grouped[fid].append(r)
 
-    def _build_comp_text(r: dict) -> str:
-        """Build assessment text for a single component result."""
-        concentration = r.get('concentration', 0)
-        banned = r.get('banned', {})
-        restricted = r.get('restricted', {})
-        usage = r.get('usage_reference', {})
-        exposure = r.get('exposure', {})
-        overall = r.get('overall_pass', False)
-        toxicology = r.get('toxicology', {})
-
-        parts = []
-
-        # Source reference (v2 S1: add [N] citation)
-        ref_source = usage.get('source', '')
-        if ref_source:
-            if 'CIR' in ref_source or '美国化妆品' in ref_source:
-                parts.append('美国化妆品原料评价委员会（CIR）评估结果显示')
-                parts.append(add_ref('CIR'))
-            elif 'SCCS' in ref_source:
-                parts.append('欧洲消费者安全科学委员会（SCCS）评估结果显示')
-                parts.append(add_ref('SCCS'))
-            elif 'IFRA' in ref_source or '国际日用香料' in ref_source:
-                parts.append('其使用符合国际日用香料香精协会（IFRA）要求')
-                parts.append(add_ref('IFRA'))
-            else:
-                parts.append(f'参考{ref_source}')
-                parts.append(add_ref(ref_source))
-
-        # Toxicology data
-        if toxicology.get('noael') and toxicology.get('moes') is not None:
-            parts.append(f'NOAEL={toxicology["noael"]} mg/kg bw/day，MOE={toxicology["moes"]:.2f}')
-        elif toxicology.get('noael'):
-            parts.append(f'NOAEL={toxicology["noael"]} mg/kg bw/day')
-        if toxicology.get('loael'):
-            parts.append(f'LOAEL={toxicology["loael"]} mg/kg bw/day')
-
-        # Usage reference
-        ref_max = usage.get('ref_max')
-        if ref_max is not None:
-            if restricted.get('restricted'):
-                parts.append(f'在驻留类化妆品中的使用浓度不超过{ref_max}%')
-            elif usage.get('within_range') is True or usage.get('within_range') is None:
-                parts.append(f'在驻留类化妆品中的使用浓度为{ref_max}%')
-        else:
-            parts.append(f'该原料的添加量为{concentration}%')
-
-        # Restricted check
-        if restricted.get('restricted'):
-            if restricted.get('concentration_ok') is True:
-                parts.append(f'本配方{concentration}%在限用范围内，应用风险在可接受范围之内')
-            elif restricted.get('concentration_ok') is False:
-                parts.append(f'本配方{concentration}%超出限用要求')
-        elif usage.get('within_range') is not False:
-            parts.append('在本产品中应用风险在可接受范围之内')
-
-        # Banned check
-        if banned.get('banned'):
-            parts.append('该原料为禁用成分')
-
-        # Exposure
-        sed_val = exposure.get('sed')
-        if sed_val is not None:
-            parts.append(f'SED={sed_val:.6f} mg/kg bw/day')
-
-        # v2 S3: TTC 决策树评估（无 NOAEL 时启用）
-        ttc = r.get('ttc', {})
-        if ttc and ttc.get('class') and not toxicology.get('noael'):
-            cls = ttc.get('class')
-            thresh = ttc.get('threshold')
-            ttc_moe = ttc.get('moe')
-            margin = ttc.get('margin')
-            sed_ug = ttc.get('sed')
-            if cls == 'exclusion':
-                parts.append(f'Cramer 决策树分类属排除类（{ttc.get("reason")}），不适用TTC法')
-            elif thresh and sed_ug and ttc_moe is not None:
-                parts.append(
-                    f'Cramer 分类 Class {cls}（{ttc.get("source")}），'
-                    f'TTC={thresh}μg/(kg·d)，'
-                    f'SED={sed_ug:.4g}μg/(kg·d)，'
-                    f'MoE={ttc_moe:.1f}，{margin or "已评估"}'
-                )
-            else:
-                parts.append(f'Cramer 分类 Class {cls}（{ttc.get("source")}），TTC={thresh}μg/(kg·d)')
-
-        # Conclusion
-        if overall and not banned.get('banned'):
-            parts.append('在正常使用条件下，该成分的使用是安全的')
-        elif not overall:
-            parts.append('在正常使用条件下，该成分的安全性需要关注')
-
-        return '，'.join(parts) + '。'
 
     def _write_para_run(p, text: str, bold: bool = False):
         """Add a formatted run to an existing paragraph."""
@@ -1109,7 +1196,7 @@ def generate_safety_report(
             # ── Single-component: "N号原料：name，[assessment]" ──
             r = group[0]
             ing_name = r.get('ingredient', '')
-            assessment_text = _build_comp_text(r)
+            assessment_text = _build_comp_text(r, _ref_registry)
 
             p = doc.add_paragraph()
             p.paragraph_format.space_after = Pt(3)
@@ -1137,7 +1224,7 @@ def generate_safety_report(
             # Each component sub-paragraph: "comp_name，[assessment]"
             for r in group:
                 comp_name = r.get('ingredient', '')
-                assessment_text = _build_comp_text(r)
+                assessment_text = _build_comp_text(r, _ref_registry)
 
                 p = doc.add_paragraph()
                 p.paragraph_format.space_after = Pt(3)
@@ -1169,32 +1256,27 @@ def generate_safety_report(
           '危害。产品安全性风险物质危害识别表见表3。',
           after=6, first_line_indent=0.74)
 
-    # 表3: 安全性风险物质危害识别表（v2 S1: 添加[N]引用列）
+    # 表3: 安全性风险物质危害识别表
     _para(doc, '表3  安全性风险物质危害识别', bold=True, size=14, size_cjk=14,
           align=WD_ALIGN_PARAGRAPH.CENTER, after=4)
 
-    hazard_headers = ['标准中文名称', '可能含有的风险物质', '备注', '参考文献']
+    hazard_headers = ['标准中文名称', '可能含有的风险物质', '备注']
     hazard_rows = []
     for r in results:
         ing = r.get('ingredient', '')
         risk_subs = r.get('risk_substances', [])
-        usage = r.get('usage_reference', {})
 
         if risk_subs:
             for rs in risk_subs:
-                ref = usage.get('source', '—')
-                ref_marker = add_ref(ref) if ref and ref != '—' else '—'
-                hazard_rows.append([rs, '见各成分安全评估章节', '符合限量要求', ref_marker])
+                hazard_rows.append([rs, '见各成分安全评估章节', '符合限量要求'])
         else:
-            ref = usage.get('source', '—')
-            ref_marker = add_ref(ref) if ref and ref != '—' else '—'
-            hazard_rows.append([ing, '通过安全评估', '无风险', ref_marker])
+            hazard_rows.append([ing, '通过安全评估', '无风险'])
 
     if not hazard_rows:
         hazard_rows.append(['—', '—', '—'])
 
     _add_table(doc, hazard_headers, hazard_rows,
-               col_widths=[3.0, 4.0, 3.0, 2.0])
+               col_widths=[3.0, 5.0, 3.0])
 
     _para(doc, '', after=6)
     _para(doc,
@@ -1259,6 +1341,13 @@ def generate_safety_report(
           '主要暴露方式为经皮吸收，根据产品的特性，'
           '对本产品的暴露评估仅考虑经皮途径。',
           after=4, first_line_indent=0.74)
+
+    # v2 S4: 气雾剂推进剂说明
+    propellant_pct = (assessment_result or {}).get('propellant_percent', 0) or 0
+    if propellant_pct > 0:
+        _para(doc,
+              f'本产品含推进剂（{propellant_pct:.1f}%），其他原料浓度已扣除推进剂后×100%计。',
+              after=4, first_line_indent=0.74)
 
     _para(doc,
           '通过对产品以下各方面的综合评估：',
@@ -1379,6 +1468,172 @@ def generate_safety_report(
 
 
 # ── Utility functions ──
+
+def build_3tables_data(formula: list[dict], results: list[dict]) -> dict:
+    """Build data for the 3 main report tables.
+    Returns: {
+        'table1': {'title': '表1  产品配方表', 'headers': [...], 'rows': [[...]]},
+        'table2': {'title': '表2  实际成分含量', ...},
+        'table3': {'title': '表3  安全性风险物质危害识别', ...}
+    }
+    """
+    # ── 表1: 产品配方表 ──
+    seen_ingredients = {}
+    for r in results:
+        name = r.get('ingredient', '')
+        inci = r.get('inci_name', '')
+        purpose = r.get('purpose', '—')
+        conc = r.get('concentration', 0)
+        code = r.get('used_raw_code', '')
+        if name in seen_ingredients:
+            seen_ingredients[name].append((inci, purpose, conc, code))
+        else:
+            seen_ingredients[name] = [(inci, purpose, conc, code)]
+
+    table1_rows = []
+    idx = 1
+    for ing_name, variants in seen_ingredients.items():
+        if len(variants) == 1:
+            inci, purpose, conc, code = variants[0]
+            table1_rows.append([str(idx), ing_name, inci, purpose, code or '—', ''])
+            idx += 1
+        else:
+            first = True
+            for inci, purpose, conc, code in variants:
+                table1_rows.append([str(idx) if first else '', ing_name, inci, purpose, code or '—', ''])
+                first = False
+            idx += 1
+    if not table1_rows:
+        table1_rows = [['—', '—', '—', '—', '—', '—']]
+
+    # ── 表2: 实际成分含量 ──
+    components = _compute_actual_components(formula)
+    seen = {}
+    for c in components:
+        name = c['name']
+        pct = c['percent']
+        if name in seen:
+            seen[name]['percent'] += pct
+        else:
+            seen[name] = {'percent': pct, 'inci': c.get('inci', c.get('source', ''))}
+    table2_rows = []
+    for name, data in sorted(seen.items(), key=lambda x: -x[1]['percent']):
+        table2_rows.append([name, data['inci'], f'{data["percent"]:.2f}%'])
+    if not table2_rows:
+        table2_rows = [['—', '—', '—']]
+
+    # ── 表 3: 安全性风险物质危害识别 ──
+    # 加载风险物质规则
+    risk_rules = {}
+    try:
+        risk_path = os.path.join(os.path.dirname(__file__), 'userdata', 'risk_substances.json')
+        with open(risk_path, 'r', encoding='utf-8') as f:
+            risk_data = json.load(f)
+            # 建立风险物质名称到完整信息的映射
+            for rs in risk_data.get('general_risk_substances', []):
+                risk_rules[rs['name']] = rs
+            for rs in risk_data.get('child_risk_substances', []):
+                risk_rules[rs['name']] = rs
+    except Exception:
+        pass  # 如果加载失败，使用默认逻辑
+    
+    # 判断产品类型：牙膏还是化妆品
+    # 通过产品名称或配方特征判断
+    is_toothpaste = False
+    if product_name and ('牙膏' in product_name or '口腔' in product_name):
+        is_toothpaste = True
+    
+    # 使用表 2 的标准中文名称数据（来自_compute_actual_components）
+    components = _compute_actual_components(formula)
+    
+    # 建立原料名称到标准中文名称的映射（用于查找风险物质）
+    # 因为 risk_substances 是基于原料名称评估的
+    raw_material_to_std = {}
+    for comp in components:
+        source = comp.get('source', '')  # 原料名称
+        std_name = comp.get('name', '')  # 标准中文名称
+        if source and std_name:
+            if source not in raw_material_to_std:
+                raw_material_to_std[source] = set()
+            raw_material_to_std[source].add(std_name)
+    
+    # 收集所有需要显示的标准中文名称（去重）
+    std_names_set = set()
+    for comp in components:
+        std_names_set.add(comp.get('name', ''))
+    
+    table3_rows = []
+    # 遍历所有标准中文名称
+    for std_name in sorted(std_names_set):
+        # 查找该标准中文名称对应的原料（可能有多个原料对应同一个标准中文名称）
+        matched_risk_substances = []
+        
+        # 反向查找：找到哪些原料包含这个标准中文名称
+        for raw_name, std_names in raw_material_to_std.items():
+            if std_name in std_names:
+                # 在安全评估结果中查找该原料的风险物质
+                for r in results:
+                    if r.get('ingredient', '') == raw_name:
+                        risk_subs = r.get('risk_substances', [])
+                        if risk_subs:
+                            matched_risk_substances.extend(risk_subs)
+                        break
+        
+        # 去重
+        matched_risk_substances = list(set(matched_risk_substances))
+        
+        if matched_risk_substances:
+            # 有对应的风险物质，显示每个风险物质
+            for risk_name in matched_risk_substances:
+                # 从风险物质规则中获取详细信息
+                risk_info = risk_rules.get(risk_name, {})
+                full_description = risk_info.get('description', '符合限量要求')
+                
+                # 根据产品类型选择对应的描述
+                # 描述格式："化妆品：xxx 描述。牙膏：xxx 描述。"
+                if is_toothpaste:
+                    # 牙膏产品，提取牙膏部分的描述
+                    if '牙膏：' in full_description:
+                        # 提取"牙膏："后面的内容
+                        description = full_description.split('牙膏：')[1].split('。')[0] + '。'
+                    else:
+                        # 如果没有牙膏描述，使用完整描述
+                        description = full_description
+                else:
+                    # 化妆品，提取化妆品部分的描述
+                    if '化妆品：' in full_description:
+                        # 提取"化妆品："后面的内容，到"牙膏："之前
+                        description = full_description.split('化妆品：')[1].split('。牙膏：')[0] + '。'
+                    else:
+                        # 如果没有化妆品描述，使用完整描述
+                        description = full_description
+                
+                table3_rows.append([std_name, risk_name, description])
+        else:
+            # 无对应的风险物质
+            table3_rows.append([std_name, '无', '/'])
+
+    if not table3_rows:
+        table3_rows = [['—', '—', '—']]
+
+    return {
+        'table1': {
+            'title': '表1  产品配方表',
+            'headers': ['序号', '中文名称', 'INCI名称/英文名称', '使用目的', '在《已使用原料目录》中的序号', '备注'],
+            'rows': table1_rows,
+        },
+        'table2': {
+            'title': '表2  实际成分含量',
+            'headers': ['标准中文名称', 'INCI名', '实际成分含量（%）'],
+            'rows': table2_rows,
+        },
+        'table3': {
+            'title': '表3  安全性风险物质危害识别',
+            'headers': ['标准中文名称', '可能含有的风险物质', '备注'],
+            'rows': table3_rows,
+        },
+    }
+
 
 def save_report_to_file(filepath: str, report_bytes: bytes):
     """Save report bytes to file."""

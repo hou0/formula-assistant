@@ -567,7 +567,6 @@ def calc_moe(noael: float, sed: float) -> float:
 # ═══════════════════════════════════════════════
 # v2 S3: TTC (Threshold of Toxicological Concern) 阈值法
 # 数据源: userdata/ttc_crashdb.json
-# 教材: 国家药监局高级研修学院《化妆品安全评估基础与实践》2025.4 第三章
 # ═══════════════════════════════════════════════
 _TTC_DB = None
 _TTC_DB_PATH = os.path.join(os.path.dirname(__file__), 'userdata', 'ttc_crashdb.json')
@@ -697,6 +696,124 @@ def calc_ttc_assessment(
     }
 
 
+# ═══════════════════════════════════════════════
+# v2 S5: Read-across 类比评估
+# 数据源: userdata/read_across_seed.json
+# ═══════════════════════════════════════════════
+_RA_DB = None
+_RA_DB_PATH = os.path.join(os.path.dirname(__file__), 'userdata', 'read_across_seed.json')
+
+
+def _load_ra_db():
+    global _RA_DB
+    if _RA_DB is None:
+        try:
+            with open(_RA_DB_PATH, 'r', encoding='utf-8') as f:
+                _RA_DB = json.load(f)
+        except Exception:
+            _RA_DB = {'analogues': [], 'applicability': {'suitable_for': [], 'not_suitable_for': []}}
+    return _RA_DB
+
+
+def calc_read_across(name_zh: str = '', name_inci: str = '',
+                     purpose: str = '') -> dict:
+    """Read-across 类比评估。返回最匹配的结构类似物。
+    Returns: {applicable, analogue_id, source, analogue, noael, uncertainty_factor, data_quality, reason, summary}
+    """
+    db = _load_ra_db()
+
+    # 1. Check purpose exclusion list
+    for excl in db.get('applicability', {}).get('not_suitable_for', []):
+        if excl in purpose or excl in name_zh or excl in name_inci:
+            return {
+                'applicable': False,
+                'reason': f'命中排除用途「{excl}」，不适用read-across法',
+                'analogue_id': None, 'source': None, 'analogue': None,
+                'noael': None, 'uncertainty_factor': None, 'data_quality': None,
+                'summary': '不适用read-across法',
+            }
+
+    # 2. Find best match
+    name_combined = (name_zh or '') + '|' + (name_inci or '')
+    for ana in db.get('analogues', []):
+        source = ana.get('source', '')
+        if any(part.strip() and part.strip() in name_combined
+               for part in source.split('(')):
+            return {
+                'applicable': True,
+                'analogue_id': ana.get('id'),
+                'source': source,
+                'analogue': ana.get('analogue'),
+                'justification': ana.get('justification'),
+                'noael_source': ana.get('noael_source'),
+                'uncertainty_factor': ana.get('uncertainty_factor', 1),
+                'data_quality': ana.get('data_quality', '中'),
+                'ref': ana.get('ref'),
+                'reason': f'类比至「{ana.get("analogue")}」',
+                'summary': f'Read-across 类比至 {ana.get("analogue")}，'
+                           f'NOAEL 来自 {ana.get("noael_source")}，'
+                           f'不确定因子 {ana.get("uncertainty_factor")}',
+            }
+
+    return {
+        'applicable': False,
+        'reason': '未找到结构类比物',
+        'analogue_id': None, 'source': None, 'analogue': None,
+        'noael': None, 'uncertainty_factor': None, 'data_quality': None,
+        'summary': '无可用类比物',
+    }
+
+
+# ═══════════════════════════════════════════════
+# v2 S6: NOAEL 毒理学数据库
+# 数据源: userdata/toxicology_seed.json
+# ═══════════════════════════════════════════════
+_TOX_DB = None
+_TOX_DB_PATH = os.path.join(os.path.dirname(__file__), 'userdata', 'toxicology_seed.json')
+
+
+def _load_tox_db():
+    global _TOX_DB
+    if _TOX_DB is None:
+        try:
+            with open(_TOX_DB_PATH, 'r', encoding='utf-8') as f:
+                _TOX_DB = json.load(f)
+        except Exception:
+            _TOX_DB = {'entries': [], 'common_factors': {}}
+    return _TOX_DB
+
+
+def query_noael(name_zh: str = '', name_inci: str = '', cas_no: str = '') -> dict:
+    """从毒理学数据库查询 NOAEL/LOAEL。
+    Returns: {found, noael, loael, study_type, species, uncertainty_factor, ref, source_match, summary}
+    """
+    db = _load_tox_db()
+    name_combined = (name_zh or '') + '|' + (name_inci or '')
+
+    for e in db.get('entries', []):
+        for k in (e.get('name_zh', ''), e.get('name_inci', ''), e.get('cas_no', '')):
+            if k and k in name_combined:
+                return {
+                    'found': True,
+                    'noael': e.get('noael_mg_kg_day'),
+                    'loael': e.get('loael_mg_kg_day'),
+                    'study_type': e.get('study_type'),
+                    'species': e.get('species'),
+                    'uncertainty_factor': e.get('uncertainty_factor', 100),
+                    'route': e.get('route'),
+                    'ref': e.get('ref'),
+                    'source_match': e.get('name_zh', '') + '/' + e.get('name_inci', ''),
+                    'summary': f'NOAEL={e.get("noael_mg_kg_day")} mg/kg/day（{e.get("study_type")}, {e.get("species")}）',
+                }
+
+    return {
+        'found': False,
+        'noael': None, 'loael': None, 'study_type': None, 'species': None,
+        'uncertainty_factor': 100, 'route': None, 'ref': None, 'source_match': None,
+        'summary': '数据库无该原料 NOAEL 记录',
+    }
+
+
 
 def assess_ingredient(
     name_zh: str,
@@ -764,6 +881,24 @@ def assess_ingredient(
     # Layer 6: Risk substance identification (based on 《化妆品风险物质识别与评估技术指导原则》)
     result['risk_substances'] = identify_risk_substances(name_zh, is_child_product)
 
+    # Layer 6.5: v2 S6 NOAEL 毒理学数据库查询
+    tox = query_noael(name_zh=name_zh, name_inci=name_inci, cas_no=cas_no)
+    toxicology = {
+        'noael': tox.get('noael'),
+        'loael': tox.get('loael'),
+        'study_type': tox.get('study_type'),
+        'species': tox.get('species'),
+        'uncertainty_factor': tox.get('uncertainty_factor', 100),
+        'ref': tox.get('ref'),
+        'source_match': tox.get('source_match'),
+        'found': tox.get('found'),
+    }
+    if tox.get('found') and tox.get('noael'):
+        sed_mg_for_moe = (result.get('exposure') or {}).get('sed')
+        if sed_mg_for_moe and sed_mg_for_moe > 0:
+            toxicology['moes'] = tox['noael'] / sed_mg_for_moe
+    result['toxicology'] = toxicology
+
     # Layer 7: v2 S3 TTC threshold assessment (Cramer + MoE)
     sed_ug = None
     sed_mg = (result.get('exposure') or {}).get('sed')
@@ -775,6 +910,15 @@ def assess_ingredient(
         sed_ug_per_kg_day=sed_ug,
         cas_no=cas_no,
     )
+
+    # Layer 8: v2 S5 Read-across 类比评估（仅当无 NOAEL 且无合适 TTC 时启用）
+    has_noael = bool(toxicology.get('noael') if isinstance(toxicology, dict) else False)
+    if not has_noael:
+        result['read_across'] = calc_read_across(
+            name_zh=name_zh, name_inci=name_inci, purpose=purpose,
+        )
+    else:
+        result['read_across'] = {'applicable': False, 'reason': '已有 NOAEL，优先使用 NOAEL 法'}
 
     # Overall assessment summary
     issues = []

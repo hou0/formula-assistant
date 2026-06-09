@@ -2255,9 +2255,14 @@ userdata/
 ├── safety.db                    # SQLite数据库（法规数据）
 ├── safety_config.json           # 安全评估配置（常量、法规模板）
 ├── risk_substances.json         # 风险物质识别规则
+├── risk_control_rules.json      # 风险控制措施规则库
 ├── ingredient_catalog.json      # 已使用化妆品原料目录I
 ├── ingredient_catalog_ii.json   # 已使用化妆品原料目录II
 ├── cosing_data.json             # COSING（欧盟化妆品原料数据库）
+├── toxicology_seed.json         # NOAEL/LOAEL种子数据
+├── references_seed.json         # 参考文献库
+├── ttc_crashdb.json             # TTC Cramer分类种子库
+├── read_across_seed.json        # 交叉参照评估库
 ├── projects/                    # 项目配置文件目录
 │   └── *.json                  # 各项目配置
 ├── 化学结构式图片/              # 化学结构式图片存储
@@ -2272,9 +2277,14 @@ userdata/
 | `safety.db` | 存储禁用/限用/准用组分、使用量数据等 | 定期（法规更新时） |
 | `safety_config.json` | 存储常量（如默认体重60kg）、法规模板字符串 | 低频（法规更新时） |
 | `risk_substances.json` | 存储风险物质识别规则 | 定期（法规更新时） |
+| `risk_control_rules.json` | 风险控制措施规则库（9 类第二类情形一） | 法规变化时 |
 | `ingredient_catalog.json` | 已使用化妆品原料目录I | 定期（目录更新时） |
 | `ingredient_catalog_ii.json` | 已使用化妆品原料目录II | 定期（目录更新时） |
 | `cosing_data.json` | 欧盟化妆品原料数据库 | 定期 |
+| `toxicology_seed.json` | NOAEL/LOAEL种子数据 | 季度更新 |
+| `references_seed.json` | 参考文献库（SCCS/CIR/ECHA/法规） | 季度更新 |
+| `ttc_crashdb.json` | TTC Cramer分类种子库 | 季度更新 |
+| `read_across_seed.json` | 交叉参照评估库 | 季度更新 |
 
 ### **6.5 多国法规结构**
 
@@ -2282,12 +2292,14 @@ userdata/
 
 ### **6.6 v2 新增数据文件**
 
+（说明：以下文件已纳入 6.4 数据文件清单，此处保留数据源参考信息）
+
 | 文件 | 用途 | 数据源 | 维护 |
 |---|---|---|---|
-| `userdata/references_seed.json` | 参考文献库（SCCS/CIR/ECHA/法规标准基础引用）| 教材 p.245 案例 + 国家局公告 | 季度更新 |
-| `userdata/risk_control_rules.json` | 风险控制措施规则库（9 类第二类情形一）| 教材 p.211 表7-2 | 法规变化时 |
-| `userdata/ttc_crashdb.json` | TTC Cramer 分类种子库（50 常见原料）| 教材 p.252-270 案例 + Toxtree | 季度更新 |
-| `userdata/toxicology_seed.json` | NOAEL/LOAEL seed（50 常见原料 CIR/SCCS 数据）| 教材案例 + CIR Final Reports | 季度更新 |
+| `references_seed.json` | 参考文献库（SCCS/CIR/ECHA/法规标准基础引用）| 教材 p.245 案例 + 国家局公告 | 季度更新 |
+| `risk_control_rules.json` | 风险控制措施规则库（9 类第二类情形一）| 教材 p.211 表7-2 | 法规变化时 |
+| `ttc_crashdb.json` | TTC Cramer 分类种子库（50 常见原料）| 教材 p.252-270 案例 + Toxtree | 季度更新 |
+| `toxicology_seed.json` | NOAEL/LOAEL seed（50 常见原料 CIR/SCCS 数据）| 教材案例 + CIR Final Reports | 季度更新 |
 
 ## **7. 非功能需求**
 
